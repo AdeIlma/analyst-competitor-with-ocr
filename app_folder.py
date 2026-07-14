@@ -19,6 +19,7 @@ import os
 import time
 import zipfile
 import tempfile
+from collections import Counter
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -36,10 +37,29 @@ def get_engine():
 
 
 PRICE_RE = re.compile(r'^\d{1,3}(?:\.\d{3})+$')
-VOLUME_RE = re.compile(r'^\d+\s*m[li]$', re.IGNORECASE)
-AGE_RE = re.compile(r'^\[?(?:18|21)\+?\]?$')
 NOISE = {'tambah', 'menu', 'masuk', 'beranda', 'rekomendasi',
          'gofood', 'gofood hemat', 'home'}
+
+# Tag umur ("21+", "[18+]") dan kata generik disclaimer ("minuman beralkohol", atau
+# variannya yg kepisah spasi jadi "minuman ber alkohol") -> ini yang dibuang.
+# Volume/kadar alkohol (mis. "620ml", "19%") SENGAJA TIDAK dibuang -> tetap
+# menempel jadi bagian dari nama produk.
+AGE_FIND_RE = re.compile(r'\[?\b(?:18|21)\b\s*\+?\]?', re.IGNORECASE)
+GENERIC_RE = re.compile(r'\b(?:minuman|ber|beralkohol|alkohol)\b', re.IGNORECASE)
+
+
+def clean_disclaimer(text, age_match):
+    """Buang tag umur & kata generik disclaimer dari suatu baris teks. Volume/kadar
+    alkohol yang mungkin ada di baris yang sama TIDAK ikut dibuang, jadi kalau baris
+    itu sebenarnya cuma disclaimer (mis. '21+ minuman beralkohol'), hasilnya jadi
+    kosong; kalau ada volume/nama asli (mis. '700ml. 21+ minuman beralkohol' atau
+    'ANGGUR MERAH GOLD 19% 620ML'), sisanya tetap ada."""
+    cleaned = text
+    if age_match:
+        cleaned = cleaned.replace(age_match.group(), ' ')
+    cleaned = GENERIC_RE.sub(' ', cleaned)
+    cleaned = re.sub(r'[.,;:]+', ' ', cleaned)
+    return re.sub(r'\s+', ' ', cleaned).strip()
 
 
 def is_price(text):
@@ -51,9 +71,9 @@ def is_name_line(text):
     low = t.lower()
     if len(t) < 3 or is_price(t):
         return False
-    if low in NOISE or AGE_RE.match(t) or VOLUME_RE.match(t):
+    if low in NOISE:
         return False
-    if low.startswith('abs') or low.startswith('lokal produk'):
+    if low == 'abs' or low.startswith('lokal produk'):
         return False
     return any(c.isalpha() for c in t)
 
@@ -80,16 +100,40 @@ def extract_path(path, col_tol, row_tol):
         return []
     items = [{'text': t.strip(), **dict(zip(('cx', 'cy'), center(b)))}
              for b, t, s in result]
-    prices = [it for it in items if is_price(it['text'])]
-    names = [it for it in items if is_name_line(it['text'])]
+
+    prices, names = [], []
+    for it in items:
+        text = it['text']
+        if is_price(text):
+            prices.append(it)
+            continue
+        age_match = AGE_FIND_RE.search(text)
+        cleaned = clean_disclaimer(text, age_match)
+        if not cleaned:
+            continue  # murni disclaimer/tag umur (mis. "21+", "Minuman ber alkohol") -> buang total
+        if is_name_line(cleaned):
+            names.append({'text': cleaned, 'cx': it['cx'], 'cy': it['cy']})
+
+    # Teks yang MUNCUL BERULANG di banyak kartu dalam satu gambar (mis. "Best
+    # Seller", "Rekomendasi") hampir pasti label generik/template, bukan nama
+    # produk -> deteksi otomatis & buang. Teks yang MENGANDUNG ANGKA (mis. "620ml",
+    # "19%") dikecualikan dari pengecekan ini, karena volume/kadar alkohol yang
+    # sama wajar muncul di banyak produk berbeda dan tetap harus dipertahankan.
+    name_counts = Counter(n['text'].lower() for n in names
+                          if not any(ch.isdigit() for ch in n['text']))
+    dynamic_noise = {t for t, c in name_counts.items() if c >= 2}
 
     hasil = []
     for p in prices:
-        near = [n for n in names
-                if abs(n['cx'] - p['cx']) < col_tol
-                and abs(n['cy'] - p['cy']) < row_tol]
-        near.sort(key=lambda n: n['cy'])
-        nama = ' '.join(n['text'] for n in near) if near else None
+        # Nama HANYA diambil dari teks DI ATAS harga (cy lebih kecil), supaya
+        # badge/keterangan di BAWAH harga (mis. "Dapat dicustom" sebelum tombol
+        # Tambah) tidak ikut ke-gabung ke nama.
+        candidates = [n for n in names
+                      if abs(n['cx'] - p['cx']) < col_tol
+                      and 0 <= p['cy'] - n['cy'] < row_tol]
+        candidates.sort(key=lambda n: n['cy'])
+        chosen = [n for n in candidates if n['text'].lower() not in dynamic_noise]
+        nama = ' '.join(n['text'] for n in chosen) if chosen else None
         hasil.append({'nama': nama, 'harga': int(p['text'].replace('.', ''))})
     return hasil
 
